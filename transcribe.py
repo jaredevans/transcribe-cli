@@ -17,10 +17,10 @@ MODELS_DIR = Path("~/.models/whisper").expanduser()
 V3_MODEL = MODELS_DIR / "ggml-large-v3.bin"
 V2_MODEL = MODELS_DIR / "ggml-large-v2.bin"
 
-if V3_MODEL.exists():
-    DEFAULT_MODEL_PATH = str(V3_MODEL)
-else:
+if V2_MODEL.exists():
     DEFAULT_MODEL_PATH = str(V2_MODEL)
+else:
+    DEFAULT_MODEL_PATH = str(V3_MODEL)
 
 DEFAULT_MODEL_PATH = os.environ.get("MODEL_PATH", DEFAULT_MODEL_PATH)
 

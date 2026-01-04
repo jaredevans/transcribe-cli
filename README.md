@@ -32,8 +32,8 @@ It automates the entire pipeline: audio extraction, language detection, translat
 ### Model Selection
 
 The script looks for Whisper models in `~/.models/whisper/`. It prioritizes:
-1.  `ggml-large-v3.bin` (if it exists)
-2.  `ggml-large-v2.bin` (fallback)
+1.  `ggml-large-v2.bin` (default & preferred for stability)
+2.  `ggml-large-v3.bin` (fallback)
 
 You can specify the version via `--model-version` or provide a direct path using the `MODEL_PATH` environment variable.
 
