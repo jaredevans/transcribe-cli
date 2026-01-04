@@ -39,17 +39,17 @@ BASE_DECODE_ARGS = [
     "-ml", "60",
     "-tp", "0.50",
     "-tpi", "0.10",
-    "--prompt", "Translate accurately."
 ]
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Auto-detect spoken language from a midpoint sample, then translate to English SRT.")
+    parser = argparse.ArgumentParser(description="Auto-detect spoken language, then transcribe (if English) or translate (if other) to SRT.")
     parser.add_argument("input", help="Input audio or video file")
     parser.add_argument("--threads", default=DEFAULT_THREADS, help=f"Number of threads (default: {DEFAULT_THREADS})")
     parser.add_argument("--beam-size", default=DEFAULT_BEAM_SIZE, help=f"Beam size (default: {DEFAULT_BEAM_SIZE})")
     parser.add_argument("--detect-duration", default=DEFAULT_DETECT_DURATION, help=f"Seconds for midpoint language sample (default: {DEFAULT_DETECT_DURATION})")
     parser.add_argument("--model-version", choices=["v2", "v3"], default="v2", help="Whisper model version to use (default: v2)")
     parser.add_argument("--no-post", action="store_true", help="Skip SRT post-processing")
+    parser.add_argument("--transcribe", action="store_true", help="Force English transcription regardless of detected language")
     return parser.parse_args()
 
 def check_requirements(whisper_cli, model_path, input_file):
@@ -95,6 +95,14 @@ def parse_timestamp(ts_str):
         return (h * 3600 + m * 60 + s) * 1000 + ms
     except ValueError:
         return 0
+
+def normalize_text(t):
+    if not t:
+        return ""
+    # Remove punctuation and lowercase
+    t = re.sub(r'[^\w\s]', '', t).lower()
+    # Collapse multiple spaces and strip
+    return " ".join(t.split())
 
 def rebalance_sentences(blocks, max_chars=88, min_dur_ms=500):
     """
@@ -165,23 +173,36 @@ def rebalance_sentences(blocks, max_chars=88, min_dur_ms=500):
         nxt = split_blocks[i]
         
         # A block is finished if it ends in punctuation
-        is_curr_finished = any(curr['text'].endswith(p) for p in ['.', '!', '?', '"', '”'])
-        # A block is a fragment if it DOES NOT end in punctuation
-        is_nxt_fragment = not any(nxt['text'].endswith(p) for p in ['.', '!', '?', '"', '”'])
+        is_curr_finished = any(curr['text'].strip().endswith(p) for p in ['.', '!', '?', '"', '”'])
         
         # Check if they are very close in time (gap < 1.5s)
-        is_close = (nxt['start'] - curr['end']) < 1500
+        gap = nxt['start'] - curr['end']
+        is_close = gap < 1500
         combined_text = (curr['text'] + " " + nxt['text']).strip()
+        
+        # Normalize for repeat detection
+        n_curr = normalize_text(curr['text'])
+        n_nxt = normalize_text(nxt['text'])
         
         should_merge = False
         if len(combined_text) <= max_chars:
-            if not is_curr_finished:
-                # Always merge if current is a fragment (it needs to be completed)
-                should_merge = True
-            # User preference: Do not merge finished sentences, even if they are short.
-            # elif not is_nxt_fragment:
-            #     if is_close and (len(curr['text']) < 40 or len(nxt['text']) < 40):
-            #         should_merge = True
+            # If they are constructive repeats (identical or one contained in other),
+            # DO NOT merge them. This allows Pass 3 to dedup them while keeping 
+            # the original timing of the first one.
+            is_constructive_repeat = False
+            if n_curr and n_nxt:
+                if n_curr == n_nxt:
+                    is_constructive_repeat = True
+                elif (n_nxt in n_curr or n_curr in n_nxt) and is_close:
+                    is_constructive_repeat = True
+
+            if not is_constructive_repeat:
+                if not is_curr_finished:
+                    # Always merge if current is a fragment (it needs to be completed)
+                    should_merge = True
+                # Optional: also merge if they are very close and both are short
+                # elif is_close and (len(curr['text']) < 40 and len(nxt['text']) < 40):
+                #     should_merge = True
 
         if should_merge:
             curr['text'] = combined_text
@@ -191,13 +212,6 @@ def rebalance_sentences(blocks, max_chars=88, min_dur_ms=500):
             curr = nxt
     
     merged_blocks.append(curr)
-
-    # Final polish: ensure minimum duration and non-zero intervals
-    for blk in merged_blocks:
-        if (blk['end'] - blk['start']) < min_dur_ms:
-            blk['end'] = blk['start'] + min_dur_ms
-            
-    return merged_blocks
 
     # Final polish: ensure minimum duration and non-zero intervals
     for blk in merged_blocks:
@@ -241,31 +255,49 @@ def post_process_srt(srt_path, min_dur_ms, dedup_window_ms, allow_overlap_ms):
         
         parsed_blocks.append({'start': start_ms, 'end': end_ms, 'text': text})
 
-    # Pass 1: Dedup and temporal cleanup
+    # Pass 1: Temporal cleanup
     cleaned_blocks = []
     have_prev = False
-    prev_start, prev_end, prev_text = 0, 0, ""
+    prev_end = 0
 
     for blk in parsed_blocks:
         start, end, text = blk['start'], blk['end'], blk['text']
-
         if have_prev and start < (prev_end - allow_overlap_ms):
             start = prev_end
-        
-        if have_prev and prev_text == text and (start - prev_end) <= dedup_window_ms:
-            if end > prev_end:
-                prev_end = end
-        else:
-            if have_prev:
-                cleaned_blocks.append({'start': prev_start, 'end': prev_end, 'text': prev_text})
-            prev_start, prev_end, prev_text = start, end, text
-            have_prev = True
-            
-    if have_prev:
-        cleaned_blocks.append({'start': prev_start, 'end': prev_end, 'text': prev_text})
+        cleaned_blocks.append({'start': start, 'end': end, 'text': text})
+        prev_end = end
+        have_prev = True
 
     # Pass 2: Rebalance (Split/Merge sentences)
-    final_blocks = rebalance_sentences(cleaned_blocks)
+    rebalanced_blocks = rebalance_sentences(cleaned_blocks, min_dur_ms=min_dur_ms)
+
+    # Pass 3: Final Dedup (consecutive repeated text)
+    final_blocks = []
+    if rebalanced_blocks:
+        curr = rebalanced_blocks[0]
+        final_blocks.append(curr)
+        for i in range(1, len(rebalanced_blocks)):
+            nxt = rebalanced_blocks[i]
+            
+            n_curr = normalize_text(curr['text'])
+            n_nxt = normalize_text(nxt['text'])
+            
+            is_repeat = False
+            if not n_nxt:
+                is_repeat = True
+            elif n_curr:
+                if n_curr == n_nxt:
+                    is_repeat = True
+                elif (n_nxt in n_curr or n_curr in n_nxt) and (nxt['start'] - curr['end'] < dedup_window_ms):
+                    # Constructive repetition (subset/superset within window)
+                    is_repeat = True
+
+            if is_repeat:
+                # Skip duplicate. Keep the first one's timing.
+                continue
+
+            final_blocks.append(nxt)
+            curr = nxt
 
     # Write back to SRT
     with open(srt_path, 'w', encoding='utf-8') as f:
@@ -327,55 +359,56 @@ def main():
             audio_src = tmp_wav.name
 
         # ---------- LANGUAGE DETECTION ----------
-        print(f"🌍 Detecting spoken language (using {args.detect_duration}s sample from midpoint)...")
-        
-        tmp_detect = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        tmp_detect.close()
-        temp_files.append(tmp_detect.name)
-        
-        duration_sec = get_duration(audio_src)
-        start_time = 0
-        if duration_sec > 0:
-            start_time = int(duration_sec / 2)
-            
-        subprocess.run([
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-ss", str(start_time), "-t", args.detect_duration,
-            "-i", audio_src, "-ac", "1", "-ar", "16000", "-vn", "-f", "wav", tmp_detect.name
-        ], check=True)
-        
-        # Run whisper detection
-        # Note: subprocess.run captures stdout/stderr if configured, but here we just want to grep the output.
-        # The bash script redirects output to a file then greps it.
-        
-        detect_cmd = [
-            whisper_cli, "-m", model_path, "-f", tmp_detect.name, "-dl", "-t", args.threads
-        ]
-        
         # Force C locale
         env = os.environ.copy()
         env["LC_ALL"] = "C"
-        
-        try:
-            result = subprocess.run(detect_cmd, capture_output=True, text=True, env=env)
-            output_log = result.stdout + result.stderr
-        except subprocess.CalledProcessError as e:
-            # -dl might exit with non-zero? Bash script does `set +e` around it.
-            output_log = e.stdout + e.stderr if e.stdout else ""
-            if e.stderr: output_log += e.stderr
 
         detected_lang = "auto"
-        # Grep equivalent: language: [a-z]{2}
-        match = re.search(r'language: ([a-z]{2})', output_log)
-        if match:
-            detected_lang = match.group(1)
-            print(f"✅ Detected language: {detected_lang}")
+        if args.transcribe:
+            detected_lang = "en"
+            print("✅ Forcing language: en (due to --transcribe)")
         else:
-            print("⚠️  Could not detect language — defaulting to 'auto'.")
+            print(f"🌍 Detecting spoken language (using {args.detect_duration}s sample from midpoint)...")
+            
+            tmp_detect = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp_detect.close()
+            temp_files.append(tmp_detect.name)
+            
+            duration_sec = get_duration(audio_src)
+            start_time = 0
+            if duration_sec > 0:
+                start_time = int(duration_sec / 2)
+                
+            subprocess.run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", str(start_time), "-t", args.detect_duration,
+                "-i", audio_src, "-ac", "1", "-ar", "16000", "-vn", "-f", "wav", tmp_detect.name
+            ], check=True)
+            
+            # Run whisper detection
+            detect_cmd = [
+                whisper_cli, "-m", model_path, "-f", tmp_detect.name, "-dl", "-t", args.threads
+            ]
+            
+            try:
+                result = subprocess.run(detect_cmd, capture_output=True, text=True, env=env)
+                output_log = result.stdout + result.stderr
+            except subprocess.CalledProcessError as e:
+                output_log = e.stdout + e.stderr if e.stdout else ""
+                if e.stderr: output_log += e.stderr
 
-        # ---------- TRANSLATE FULL AUDIO ----------
+            # Grep equivalent: language: [a-z]{2}
+            match = re.search(r'language: ([a-z]{2})', output_log)
+            if match:
+                detected_lang = match.group(1)
+                print(f"✅ Detected language: {detected_lang}")
+            else:
+                print("⚠️  Could not detect language — defaulting to 'auto'.")
+
+        # ---------- TRANSLATE/TRANSCRIBE FULL AUDIO ----------
+        action = "Transcribing" if detected_lang == "en" else "Translating"
         print()
-        print(f"🎧 Translating '{input_path.name}' ({detected_lang} → English subtitles)...")
+        print(f"🎧 {action} '{input_path.name}' ({detected_lang} → English subtitles)...")
         print(f"Model: {Path(model_path).name}")
         print(f"Output: {output_srt.name}")
         print()
@@ -394,13 +427,18 @@ def main():
             "-m", model_path,
             "-f", audio_src,
             "-l", detected_lang,
-            "-tr",
             "-osrt",
             "-of", str(output_prefix), 
             "-t", args.threads,
             "-bs", effective_beam,
             "--best-of", effective_beam
-        ] + BASE_DECODE_ARGS
+        ]
+        
+        if detected_lang != "en":
+            cmd.append("-tr")
+            
+        cmd += BASE_DECODE_ARGS
+        cmd += ["--prompt", "Transcribe accurately." if detected_lang == "en" else "Translate accurately."]
         
         try:
             subprocess.run(cmd, check=True, env=env)
@@ -411,13 +449,15 @@ def main():
                 "-m", model_path,
                 "-f", audio_src,
                 "-l", detected_lang,
-                "-tr",
                 "-osrt",
                 "-of", str(output_prefix),
                 "-t", args.threads,
                 "-bs", "5",
                 "-pp"
             ]
+            if detected_lang != "en":
+                fallback_cmd.append("-tr")
+            
             subprocess.run(fallback_cmd, check=True, env=env)
 
         # ---------- POST-PROCESS SRT ----------

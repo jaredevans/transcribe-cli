@@ -20,7 +20,7 @@ It automates the entire pipeline: audio extraction, language detection, translat
     *   Dynamic thread allocation based on your hardware.
 *   **SRT Formatting:**
     *   Clamps minimum durations to prevent flickering.
-    *   Removes duplicate lines.
+    *   **Smart Deduplication:** Removes exact duplicates and "constructive" repetitions (partial repeats), preserving the timing of the first occurrence.
     *   Ensures strict character limits (default 60 chars) for readability.
 
 ## Requirements
@@ -28,7 +28,14 @@ It automates the entire pipeline: audio extraction, language detection, translat
 *   **Python 3.6+**
 *   **ffmpeg** & **ffprobe** (must be in your PATH)
 *   **whisper-cli** (from [whisper.cpp](https://github.com/ggerganov/whisper.cpp))
-*   **Whisper Models:** `ggml-large-v2.bin` (default) or `ggml-large-v3.bin` in `~/.models/whisper/`.
+
+### Model Selection
+
+The script looks for Whisper models in `~/.models/whisper/`. It prioritizes:
+1.  `ggml-large-v3.bin` (if it exists)
+2.  `ggml-large-v2.bin` (fallback)
+
+You can specify the version via `--model-version` or provide a direct path using the `MODEL_PATH` environment variable.
 
 ## Usage
 
@@ -42,10 +49,23 @@ It automates the entire pipeline: audio extraction, language detection, translat
 | :--- | :--- | :--- |
 | `input` | Path to audio/video file. | (Required) |
 | `--model-version` | Whisper model version (`v2` or `v3`). `v2` is more stable. | `v2` |
+| `--transcribe` | Force English transcription regardless of detected language. | `False` |
 | `--threads` | Number of CPU threads to use. | Auto (half of cores) |
 | `--beam-size` | Beam size for decoding. `1` is safer for loops, `8` is better quality. | `8` |
 | `--detect-duration`| Duration (sec) to sample for language detection. | `30` |
 | `--no-post` | Skip the subtitle rebalancing/cleanup step. | `False` |
+
+### Environment Variables
+
+You can override defaults using environment variables:
+
+*   `WHISPER_CLI`: Path to the `whisper-cli` binary.
+*   `MODEL_PATH`: Direct path to a `.bin` model file.
+*   `THREADS`: Number of threads to use.
+*   `BEAM_SIZE`: Default beam size.
+*   `DETECT_DURATION`: Seconds to sample for language detection.
+*   `MIN_DUR_MS`: Minimum subtitle duration in milliseconds (default: `500`).
+*   `DEDUP_WINDOW_MS`: Time window for merging constructive repeats (default: `1500`).
 
 ### Examples
 
@@ -72,6 +92,6 @@ If you have clear audio (like a podcast) and want maximum translation quality:
 3.  **Transcribe:** Runs `whisper-cli` with tuned parameters (context window, temperature, VAD).
 4.  **Post-Process:**
     *   Parses the raw SRT.
-    *   Dedups repetitive lines.
+    *   **Smart Deduplication:** Identifies and removes consecutive repetitive text (including partial overlaps/buildups) to prevent subtitle stuttering, while strictly preserving the original start/end times of the first instance.
     *   **Rebalances:** Moves "orphan" text (sentence fragments at the end of a block) to the next block to ensure sentences are complete.
     *   Writes the final `.srt` file to the same directory as the input.
