@@ -50,6 +50,8 @@ transcribe.py [options] input_video.mp4
 | `input` | Path to audio/video file. | (Required) |
 | `--model-version` | Whisper model version (`v2` or `v3`). `v2` is more stable. | `v2` |
 | `--transcribe` | Force English transcription regardless of detected language. | `False` |
+| `--override-lang LANG` | Override detected language with a specific language code (skips auto-detection). See supported languages below. | (auto-detect) |
+| `--direct-transcribe` | Transcribe in the detected/overridden language without translating to English. | `False` |
 | `--threads` | Number of CPU threads to use. | Auto (half of cores) |
 | `--beam-size` | Beam size for decoding. `1` is safer for loops, `8` is better quality. | `8` |
 | `--detect-duration`| Duration (sec) to sample for language detection. | `30` |
@@ -67,9 +69,15 @@ You can override defaults using environment variables:
 *   `MIN_DUR_MS`: Minimum subtitle duration in milliseconds (default: `500`).
 *   `DEDUP_WINDOW_MS`: Time window for merging constructive repeats (default: `1500`).
 
+### Supported Languages
+
+Run `transcribe.py -h` to see the full list of 99 supported language codes (ISO 639-1). Common examples:
+
+`en` (English), `es` (Spanish), `fr` (French), `de` (German), `it` (Italian), `pt` (Portuguese), `ja` (Japanese), `ko` (Korean), `zh` (Chinese), `ar` (Arabic), `ru` (Russian), `hi` (Hindi), `nl` (Dutch), `pl` (Polish), `sv` (Swedish), `tr` (Turkish), `vi` (Vietnamese), `th` (Thai)
+
 ### Examples
 
-**Standard run:**
+**Standard run (auto-detect and translate to English):**
 ```
 transcribe.py video.mp4
 ```
@@ -77,6 +85,21 @@ transcribe.py video.mp4
 **Force use of Large-V3 model:**
 ```
 transcribe.py --model-version v3 video.mp4
+```
+
+**Override language (skip auto-detection, translate to English):**
+```
+transcribe.py --override-lang es video.mp4
+```
+
+**Direct transcribe in original language (no translation):**
+```
+transcribe.py --override-lang es --direct-transcribe video.mp4
+```
+
+**Direct transcribe with auto-detection (keeps detected language):**
+```
+transcribe.py --direct-transcribe video.mp4
 ```
 
 **High-Accuracy Mode (Riskier for silence):**
