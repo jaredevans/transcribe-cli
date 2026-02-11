@@ -111,7 +111,7 @@ def parse_args():
             "\n"
             "examples:\n"
             "  transcribe.py movie.mkv                          Auto-detect language, translate to English\n"
-            "  transcribe.py movie.mkv --prompt film             Explicit film preset (same as default)\n"
+            "  transcribe.py movie.mkv --prompt film             Film preset (same as default)\n"
             "  transcribe.py episode.mkv --prompt anime          Anime preset with honorific preservation\n"
             "  transcribe.py dashcam.mp4 --prompt street         Noisy recording with tighter thresholds\n"
             "  transcribe.py lecture.mp4 --prompt talk            Lecture/speech preset\n"
