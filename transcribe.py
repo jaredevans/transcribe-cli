@@ -41,8 +41,46 @@ BASE_DECODE_ARGS = [
     "-tpi", "0.10",
 ]
 
+# Whisper supported languages (ISO 639-1 codes)
+SUPPORTED_LANGUAGES = {
+    "af": "Afrikaans",    "am": "Amharic",      "ar": "Arabic",       "as": "Assamese",
+    "az": "Azerbaijani",  "ba": "Bashkir",      "be": "Belarusian",   "bg": "Bulgarian",
+    "bn": "Bengali",      "bo": "Tibetan",      "br": "Breton",       "bs": "Bosnian",
+    "ca": "Catalan",      "cs": "Czech",         "cy": "Welsh",        "da": "Danish",
+    "de": "German",       "el": "Greek",         "en": "English",      "es": "Spanish",
+    "et": "Estonian",     "eu": "Basque",        "fa": "Persian",      "fi": "Finnish",
+    "fo": "Faroese",     "fr": "French",        "gl": "Galician",     "gu": "Gujarati",
+    "ha": "Hausa",       "haw": "Hawaiian",     "he": "Hebrew",       "hi": "Hindi",
+    "hr": "Croatian",    "ht": "Haitian Creole","hu": "Hungarian",    "hy": "Armenian",
+    "id": "Indonesian",  "is": "Icelandic",     "it": "Italian",      "ja": "Japanese",
+    "jw": "Javanese",    "ka": "Georgian",      "kk": "Kazakh",       "km": "Khmer",
+    "kn": "Kannada",     "ko": "Korean",        "la": "Latin",        "lb": "Luxembourgish",
+    "ln": "Lingala",     "lo": "Lao",           "lt": "Lithuanian",   "lv": "Latvian",
+    "mg": "Malagasy",    "mi": "Maori",         "mk": "Macedonian",   "ml": "Malayalam",
+    "mn": "Mongolian",   "mr": "Marathi",       "ms": "Malay",        "mt": "Maltese",
+    "my": "Myanmar",     "ne": "Nepali",        "nl": "Dutch",        "nn": "Nynorsk",
+    "no": "Norwegian",   "oc": "Occitan",       "pa": "Punjabi",      "pl": "Polish",
+    "ps": "Pashto",      "pt": "Portuguese",    "ro": "Romanian",     "ru": "Russian",
+    "sa": "Sanskrit",    "sd": "Sindhi",        "si": "Sinhala",      "sk": "Slovak",
+    "sl": "Slovenian",   "sn": "Shona",         "so": "Somali",       "sq": "Albanian",
+    "sr": "Serbian",     "su": "Sundanese",     "sv": "Swedish",      "sw": "Swahili",
+    "ta": "Tamil",       "te": "Telugu",        "tg": "Tajik",        "th": "Thai",
+    "tk": "Turkmen",     "tl": "Tagalog",       "tr": "Turkish",      "tt": "Tatar",
+    "uk": "Ukrainian",   "ur": "Urdu",          "uz": "Uzbek",        "vi": "Vietnamese",
+    "yi": "Yiddish",     "yo": "Yoruba",        "zh": "Chinese",
+}
+
+def _format_lang_list():
+    """Format supported languages for help text."""
+    items = [f"{code} ({name})" for code, name in sorted(SUPPORTED_LANGUAGES.items())]
+    return ", ".join(items)
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Auto-detect spoken language, then transcribe (if English) or translate (if other) to SRT.")
+    parser = argparse.ArgumentParser(
+        description="Auto-detect spoken language, then transcribe (if English) or translate (if other) to SRT.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"Supported languages for --override-lang:\n  {_format_lang_list()}"
+    )
     parser.add_argument("input", help="Input audio or video file")
     parser.add_argument("--threads", default=DEFAULT_THREADS, help=f"Number of threads (default: {DEFAULT_THREADS})")
     parser.add_argument("--beam-size", default=DEFAULT_BEAM_SIZE, help=f"Beam size (default: {DEFAULT_BEAM_SIZE})")
@@ -50,6 +88,10 @@ def parse_args():
     parser.add_argument("--model-version", choices=["v2", "v3"], default="v2", help="Whisper model version to use (default: v2)")
     parser.add_argument("--no-post", action="store_true", help="Skip SRT post-processing")
     parser.add_argument("--transcribe", action="store_true", help="Force English transcription regardless of detected language")
+    parser.add_argument("--override-lang", metavar="LANG", choices=SUPPORTED_LANGUAGES.keys(),
+                        help="Override detected language with the specified language code (skips auto-detection)")
+    parser.add_argument("--direct-transcribe", action="store_true",
+                        help="Transcribe in the detected/overridden language without translating to English")
     return parser.parse_args()
 
 def check_requirements(whisper_cli, model_path, input_file):
@@ -364,7 +406,11 @@ def main():
         env["LC_ALL"] = "C"
 
         detected_lang = "auto"
-        if args.transcribe:
+        if args.override_lang:
+            detected_lang = args.override_lang
+            lang_name = SUPPORTED_LANGUAGES.get(detected_lang, detected_lang)
+            print(f"✅ Forcing language: {detected_lang} ({lang_name}) (due to --override-lang)")
+        elif args.transcribe:
             detected_lang = "en"
             print("✅ Forcing language: en (due to --transcribe)")
         else:
@@ -406,9 +452,19 @@ def main():
                 print("⚠️  Could not detect language — defaulting to 'auto'.")
 
         # ---------- TRANSLATE/TRANSCRIBE FULL AUDIO ----------
-        action = "Transcribing" if detected_lang == "en" else "Translating"
+        should_translate = detected_lang != "en" and not args.direct_transcribe
+        if args.direct_transcribe:
+            action = "Transcribing"
+            lang_name = SUPPORTED_LANGUAGES.get(detected_lang, detected_lang)
+            target_desc = f"{lang_name} subtitles"
+        elif detected_lang == "en":
+            action = "Transcribing"
+            target_desc = "English subtitles"
+        else:
+            action = "Translating"
+            target_desc = "English subtitles"
         print()
-        print(f"🎧 {action} '{input_path.name}' ({detected_lang} → English subtitles)...")
+        print(f"🎧 {action} '{input_path.name}' ({detected_lang} → {target_desc})...")
         print(f"Model: {Path(model_path).name}")
         print(f"Output: {output_srt.name}")
         print()
@@ -434,11 +490,11 @@ def main():
             "--best-of", effective_beam
         ]
         
-        if detected_lang != "en":
+        if should_translate:
             cmd.append("-tr")
-            
+
         cmd += BASE_DECODE_ARGS
-        cmd += ["--prompt", "Transcribe accurately." if detected_lang == "en" else "Translate accurately."]
+        cmd += ["--prompt", "Transcribe accurately." if not should_translate else "Translate accurately."]
         
         try:
             subprocess.run(cmd, check=True, env=env)
@@ -455,7 +511,7 @@ def main():
                 "-bs", "5",
                 "-pp"
             ]
-            if detected_lang != "en":
+            if should_translate:
                 fallback_cmd.append("-tr")
             
             subprocess.run(fallback_cmd, check=True, env=env)
