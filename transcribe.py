@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import re
 import math
+from collections import Counter
 from pathlib import Path
 
 # ---------- DEFAULT CONFIG ----------
@@ -17,29 +18,50 @@ MODELS_DIR = Path("~/.models/whisper").expanduser()
 V3_MODEL = MODELS_DIR / "ggml-large-v3.bin"
 V2_MODEL = MODELS_DIR / "ggml-large-v2.bin"
 
-if V2_MODEL.exists():
-    DEFAULT_MODEL_PATH = str(V2_MODEL)
-else:
-    DEFAULT_MODEL_PATH = str(V3_MODEL)
-
-DEFAULT_MODEL_PATH = os.environ.get("MODEL_PATH", DEFAULT_MODEL_PATH)
-
 # Dynamic threads: use half of available cores, minimum 4, maximum 12
 CPU_COUNT = os.cpu_count() or 8
-DEFAULT_THREADS = os.environ.get("THREADS", str(max(4, min(12, CPU_COUNT // 2))))
-DEFAULT_BEAM_SIZE = os.environ.get("BEAM_SIZE", "8")
-DEFAULT_DETECT_DURATION = os.environ.get("DETECT_DURATION", "30")
+DEFAULT_THREADS = int(os.environ.get("THREADS", max(4, min(12, CPU_COUNT // 2))))
+DEFAULT_BEAM_SIZE = int(os.environ.get("BEAM_SIZE", 8))
+DEFAULT_BEST_OF = int(os.environ.get("BEST_OF", 5))
+DEFAULT_DETECT_DURATION = int(os.environ.get("DETECT_DURATION", 30))
+
+# ---------- PROMPT PRESETS ----------
+PROMPT_PRESETS = {
+    "film":   "Dialogue from a film. Translate with natural, idiomatic English subtitles. Keep translations concise for readability.",
+    "anime":  "Japanese anime dialogue. Translate with natural English subtitles. Preserve character names, honorifics, and attack names. Ignore background music and sound effects.",
+    "street": "Informal recording with background noise. Translate conversational speech accurately, ignoring background audio.",
+    "talk":   "Presentation or speech. Translate accurately, preserving names, titles, and key terminology.",
+}
+
+BASE_DECODE_PARAMS = {
+    "-mc":  "256",
+    "-ml":  "60",
+    "-tp":  "0.50",
+    "-tpi": "0.10",
+}
+
+PRESET_DECODE_OVERRIDES = {
+    "anime": {
+        "--no-speech-thold": "0.6",
+        "--entropy-thold":   "1.8",
+    },
+    "street": {
+        "-tp":               "0.40",
+        "-tpi":              "0.08",
+        "--no-speech-thold": "0.3",
+        "--entropy-thold":   "1.8",
+    },
+    "talk": {
+        "-tp":             "0.55",
+        "--entropy-thold": "2.0",
+    },
+}
 
 DEFAULT_MIN_DUR_MS = int(os.environ.get("MIN_DUR_MS", "500"))
+DEFAULT_MAX_DUR_MS = int(os.environ.get("MAX_DUR_MS", "15000"))
 DEFAULT_DEDUP_WINDOW_MS = int(os.environ.get("DEDUP_WINDOW_MS", "1500"))
 DEFAULT_ALLOW_OVERLAP_MS = int(os.environ.get("ALLOW_OVERLAP_MS", "50"))
-
-BASE_DECODE_ARGS = [
-    "-mc", "256",
-    "-ml", "60",
-    "-tp", "0.50",
-    "-tpi", "0.10",
-]
+DEFAULT_MAX_CHARS = int(os.environ.get("MAX_CHARS", "120"))
 
 # Whisper supported languages (ISO 639-1 codes)
 SUPPORTED_LANGUAGES = {
@@ -79,12 +101,36 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Auto-detect spoken language, then transcribe (if English) or translate (if other) to SRT.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"Supported languages for --override-lang:\n  {_format_lang_list()}"
+        epilog=(
+            "prompt presets:\n"
+            "  film     Dialogue from a film (default for translation)\n"
+            "  anime    Japanese anime dialogue, preserves honorifics & names\n"
+            "  street   Informal/noisy recording, tighter hallucination thresholds\n"
+            "  talk     Presentation or speech, preserves terminology\n"
+            "  (any other string is used as a custom prompt)\n"
+            "\n"
+            "examples:\n"
+            "  transcribe.py movie.mkv                          Auto-detect language, translate to English\n"
+            "  transcribe.py movie.mkv --prompt film             Explicit film preset (same as default)\n"
+            "  transcribe.py episode.mkv --prompt anime          Anime preset with honorific preservation\n"
+            "  transcribe.py dashcam.mp4 --prompt street         Noisy recording with tighter thresholds\n"
+            "  transcribe.py lecture.mp4 --prompt talk            Lecture/speech preset\n"
+            "  transcribe.py interview.mp4 --prompt \"Medical terminology. Preserve drug names.\"  Custom prompt\n"
+            "  transcribe.py movie.mkv --beam-size 5 --best-of 3 Independent beam/best-of\n"
+            "  transcribe.py movie.mkv --override-lang ja        Force Japanese detection\n"
+            "  transcribe.py podcast.mp3 --transcribe            Force English transcription\n"
+            "  transcribe.py movie.mkv --direct-transcribe       Keep original language in subtitles\n"
+            "\n"
+            f"supported languages for --override-lang:\n  {_format_lang_list()}"
+        )
     )
     parser.add_argument("input", help="Input audio or video file")
-    parser.add_argument("--threads", default=DEFAULT_THREADS, help=f"Number of threads (default: {DEFAULT_THREADS})")
-    parser.add_argument("--beam-size", default=DEFAULT_BEAM_SIZE, help=f"Beam size (default: {DEFAULT_BEAM_SIZE})")
-    parser.add_argument("--detect-duration", default=DEFAULT_DETECT_DURATION, help=f"Seconds for midpoint language sample (default: {DEFAULT_DETECT_DURATION})")
+    parser.add_argument("--threads", type=int, default=DEFAULT_THREADS, help=f"Number of threads (default: {DEFAULT_THREADS})")
+    parser.add_argument("--beam-size", type=int, default=DEFAULT_BEAM_SIZE, help=f"Beam size (default: {DEFAULT_BEAM_SIZE})")
+    parser.add_argument("--best-of", type=int, default=DEFAULT_BEST_OF, help=f"Best-of candidates for decoding (default: {DEFAULT_BEST_OF})")
+    parser.add_argument("--detect-duration", type=int, default=DEFAULT_DETECT_DURATION, help=f"Seconds for language detection sample (default: {DEFAULT_DETECT_DURATION})")
+    parser.add_argument("--prompt", default=None,
+                        help=f"Prompt preset ({', '.join(PROMPT_PRESETS.keys())}) or custom prompt string (default: film for translate, generic for transcribe)")
     parser.add_argument("--model-version", choices=["v2", "v3"], default="v2", help="Whisper model version to use (default: v2)")
     parser.add_argument("--no-post", action="store_true", help="Skip SRT post-processing")
     parser.add_argument("--transcribe", action="store_true", help="Force English transcription regardless of detected language")
@@ -93,6 +139,33 @@ def parse_args():
     parser.add_argument("--direct-transcribe", action="store_true",
                         help="Transcribe in the detected/overridden language without translating to English")
     return parser.parse_args()
+
+def resolve_model_path(model_version):
+    """Select model path based on version preference with fallbacks."""
+    if model_version == "v2" and V2_MODEL.exists():
+        return str(V2_MODEL)
+    if model_version == "v3" and V3_MODEL.exists():
+        return str(V3_MODEL)
+    if V2_MODEL.exists():
+        return str(V2_MODEL)
+    if V3_MODEL.exists():
+        return str(V3_MODEL)
+    return os.environ.get("MODEL_PATH", str(V3_MODEL))
+
+def resolve_prompt(prompt_arg, is_translate):
+    """Resolve --prompt value to (preset_name_or_None, prompt_text)."""
+    if prompt_arg is None:
+        if is_translate:
+            return "film", PROMPT_PRESETS["film"]
+        return None, "Transcribe accurately."
+    if prompt_arg in PROMPT_PRESETS:
+        return prompt_arg, PROMPT_PRESETS[prompt_arg]
+    return None, prompt_arg
+
+def build_decode_args(preset_name):
+    """Merge BASE_DECODE_PARAMS with any preset overrides into a flat CLI arg list."""
+    params = {**BASE_DECODE_PARAMS, **PRESET_DECODE_OVERRIDES.get(preset_name or "", {})}
+    return [item for k, v in params.items() for item in (k, v)]
 
 def check_requirements(whisper_cli, model_path, input_file):
     if not os.path.isfile(input_file):
@@ -115,6 +188,7 @@ def get_duration(file_path):
         output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
         return float(output)
     except (subprocess.CalledProcessError, ValueError):
+        print("⚠️  Could not determine file duration via ffprobe — language detection will sample from file start.")
         return 0.0
 
 def ms_to_timestamp(ms):
@@ -235,7 +309,7 @@ def rebalance_sentences(blocks, max_chars=88, min_dur_ms=500):
             if n_curr and n_nxt:
                 if n_curr == n_nxt:
                     is_constructive_repeat = True
-                elif (n_nxt in n_curr or n_curr in n_nxt) and is_close:
+                elif (n_nxt in n_curr or n_curr in n_nxt) and is_close and min(len(n_curr), len(n_nxt)) > 40:
                     is_constructive_repeat = True
 
             if not is_constructive_repeat:
@@ -262,42 +336,42 @@ def rebalance_sentences(blocks, max_chars=88, min_dur_ms=500):
             
     return merged_blocks
 
-def post_process_srt(srt_path, min_dur_ms, dedup_window_ms, allow_overlap_ms):
+def post_process_srt(srt_path, min_dur_ms, max_dur_ms, dedup_window_ms, allow_overlap_ms, max_chars):
     with open(srt_path, 'r', encoding='utf-8') as f:
         content = f.read()
 
     # Normalize line endings and split by double newlines
     content = content.replace('\r\n', '\n').replace('\r', '\n')
     raw_blocks = content.split('\n\n')
-    
+
     parsed_blocks = []
     for block in raw_blocks:
         lines = block.strip().split('\n')
         if len(lines) < 3:
             continue
-        
+
         ts_line_idx = -1
         for i, line in enumerate(lines):
             if '-->' in line:
                 ts_line_idx = i
                 break
-        
+
         if ts_line_idx == -1:
             continue
 
         ts_line = lines[ts_line_idx]
         text = "\n".join(l.strip() for l in lines[ts_line_idx+1:] if l.strip())
-        
+
         if not text:
             continue
 
         ts_parts = ts_line.split('-->')
         start_ms = parse_timestamp(ts_parts[0].strip())
         end_ms = parse_timestamp(ts_parts[1].strip())
-        
+
         parsed_blocks.append({'start': start_ms, 'end': end_ms, 'text': text})
 
-    # Pass 1: Temporal cleanup
+    # Pass 1: Temporal cleanup — fix overlaps and cap abnormally long durations
     cleaned_blocks = []
     have_prev = False
     prev_end = 0
@@ -306,33 +380,48 @@ def post_process_srt(srt_path, min_dur_ms, dedup_window_ms, allow_overlap_ms):
         start, end, text = blk['start'], blk['end'], blk['text']
         if have_prev and start < (prev_end - allow_overlap_ms):
             start = prev_end
+        # Cap duration — a single subtitle >15s is likely hallucination over silence/music
+        if (end - start) > max_dur_ms:
+            end = start + max_dur_ms
         cleaned_blocks.append({'start': start, 'end': end, 'text': text})
         prev_end = end
         have_prev = True
 
     # Pass 2: Rebalance (Split/Merge sentences)
-    rebalanced_blocks = rebalance_sentences(cleaned_blocks, min_dur_ms=min_dur_ms)
+    rebalanced_blocks = rebalance_sentences(cleaned_blocks, max_chars=max_chars, min_dur_ms=min_dur_ms)
 
-    # Pass 3: Final Dedup (consecutive repeated text)
+    # Pass 3: Dedup — consecutive repeats and A-B-A-B alternating patterns
     final_blocks = []
     if rebalanced_blocks:
         curr = rebalanced_blocks[0]
         final_blocks.append(curr)
         for i in range(1, len(rebalanced_blocks)):
             nxt = rebalanced_blocks[i]
-            
+
             n_curr = normalize_text(curr['text'])
             n_nxt = normalize_text(nxt['text'])
-            
+
             is_repeat = False
             if not n_nxt:
                 is_repeat = True
             elif n_curr:
                 if n_curr == n_nxt:
                     is_repeat = True
-                elif (n_nxt in n_curr or n_curr in n_nxt) and (nxt['start'] - curr['end'] < dedup_window_ms):
+                elif (n_nxt in n_curr or n_curr in n_nxt) and (nxt['start'] - curr['end'] <= dedup_window_ms) and min(len(n_curr), len(n_nxt)) > 40:
                     # Constructive repetition (subset/superset within window)
                     is_repeat = True
+
+            # Alternating pattern: check up to 3 positions back in final_blocks
+            # Catches A-B-A-B, A-B-C-A, and similar short-cycle repetitions
+            if not is_repeat:
+                for lookback in range(2, min(4, len(final_blocks) + 1)):
+                    if lookback > len(final_blocks):
+                        break
+                    prev_blk = final_blocks[-lookback]
+                    n_prev = normalize_text(prev_blk['text'])
+                    if n_prev and n_nxt == n_prev and (nxt['start'] - prev_blk['end'] <= dedup_window_ms):
+                        is_repeat = True
+                        break
 
             if is_repeat:
                 # Skip duplicate. Keep the first one's timing.
@@ -340,6 +429,22 @@ def post_process_srt(srt_path, min_dur_ms, dedup_window_ms, allow_overlap_ms):
 
             final_blocks.append(nxt)
             curr = nxt
+
+    # Pass 4: Tighten start times on overlong subtitles
+    # Whisper often starts segments early (during music/silence before dialogue).
+    # Estimate comfortable reading duration from word count and shift start forward
+    # so the subtitle appears closer to when the speech actually occurs.
+    MS_PER_WORD = 400
+    MIN_READING_MS = 1500
+    OVERLONG_RATIO = 3.0
+
+    for blk in final_blocks:
+        word_count = len(blk['text'].split())
+        reading_ms = max(MIN_READING_MS, word_count * MS_PER_WORD)
+        actual_dur = blk['end'] - blk['start']
+        if actual_dur > reading_ms * OVERLONG_RATIO:
+            # Shift start forward so subtitle appears just before the end
+            blk['start'] = blk['end'] - reading_ms
 
     # Write back to SRT
     with open(srt_path, 'w', encoding='utf-8') as f:
@@ -353,21 +458,7 @@ def main():
     
     input_file = args.input
     whisper_cli = DEFAULT_WHISPER_CLI
-    
-    # Model directory
-    models_dir = Path("~/.models/whisper").expanduser()
-    v3_model = models_dir / "ggml-large-v3.bin"
-    v2_model = models_dir / "ggml-large-v2.bin"
-    
-    if args.model_version == "v2" and v2_model.exists():
-        model_path = str(v2_model)
-    elif args.model_version == "v3" and v3_model.exists():
-        model_path = str(v3_model)
-    elif v2_model.exists():
-        model_path = str(v2_model)
-    else:
-        # Fallback to whatever exists or default
-        model_path = str(v3_model) if v3_model.exists() else DEFAULT_MODEL_PATH
+    model_path = resolve_model_path(args.model_version)
     
     check_requirements(whisper_cli, model_path, input_file)
     
@@ -414,40 +505,52 @@ def main():
             detected_lang = "en"
             print("✅ Forcing language: en (due to --transcribe)")
         else:
-            print(f"🌍 Detecting spoken language (using {args.detect_duration}s sample from midpoint)...")
-            
-            tmp_detect = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            tmp_detect.close()
-            temp_files.append(tmp_detect.name)
-            
             duration_sec = get_duration(audio_src)
-            start_time = 0
-            if duration_sec > 0:
-                start_time = int(duration_sec / 2)
-                
-            subprocess.run([
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                "-ss", str(start_time), "-t", args.detect_duration,
-                "-i", audio_src, "-ac", "1", "-ar", "16000", "-vn", "-f", "wav", tmp_detect.name
-            ], check=True)
-            
-            # Run whisper detection
-            detect_cmd = [
-                whisper_cli, "-m", model_path, "-f", tmp_detect.name, "-dl", "-t", args.threads
-            ]
-            
-            try:
-                result = subprocess.run(detect_cmd, capture_output=True, text=True, env=env)
-                output_log = result.stdout + result.stderr
-            except subprocess.CalledProcessError as e:
-                output_log = e.stdout + e.stderr if e.stdout else ""
-                if e.stderr: output_log += e.stderr
+            detect_dur = str(args.detect_duration)
 
-            # Grep equivalent: language: [a-z]{2}
-            match = re.search(r'language: ([a-z]{2})', output_log)
-            if match:
-                detected_lang = match.group(1)
-                print(f"✅ Detected language: {detected_lang}")
+            # Multi-sample detection: 25%, 50%, 75% of duration (majority vote)
+            if duration_sec > args.detect_duration * 2:
+                sample_points = [0.25, 0.50, 0.75]
+                print(f"🌍 Detecting spoken language (3-point sampling at 25%/50%/75%)...")
+            else:
+                sample_points = [0.50]
+                print(f"🌍 Detecting spoken language (using {args.detect_duration}s sample from midpoint)...")
+
+            detected_langs = []
+            for frac in sample_points:
+                tmp_detect = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp_detect.close()
+                temp_files.append(tmp_detect.name)
+
+                start_time = int(duration_sec * frac) if duration_sec > 0 else 0
+
+                subprocess.run([
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-ss", str(start_time), "-t", detect_dur,
+                    "-i", audio_src, "-ac", "1", "-ar", "16000", "-vn", "-f", "wav", tmp_detect.name
+                ], check=True)
+
+                detect_cmd = [
+                    whisper_cli, "-m", model_path, "-f", tmp_detect.name, "-dl", "-t", str(args.threads)
+                ]
+
+                try:
+                    result = subprocess.run(detect_cmd, capture_output=True, text=True, env=env)
+                    output_log = result.stdout + result.stderr
+                except subprocess.CalledProcessError as e:
+                    output_log = (e.stdout or "") + (e.stderr or "")
+
+                match = re.search(r'language: ([a-z]{2})', output_log)
+                if match:
+                    detected_langs.append(match.group(1))
+
+            if detected_langs:
+                winner, count = Counter(detected_langs).most_common(1)[0]
+                detected_lang = winner
+                if len(sample_points) > 1:
+                    print(f"✅ Detected language: {detected_lang} ({count}/{len(detected_langs)} samples)")
+                else:
+                    print(f"✅ Detected language: {detected_lang}")
             else:
                 print("⚠️  Could not detect language — defaulting to 'auto'.")
 
@@ -470,12 +573,15 @@ def main():
         print()
         
         # whisper-cli often has a hard limit of 8 for beam size (decoders)
-        requested_beam = int(args.beam_size)
-        if requested_beam > 8:
-            print(f"⚠️  Note: Capping beam size at 8 (requested {requested_beam}) to match whisper-cli limits.")
-            effective_beam = "8"
+        if args.beam_size > 8:
+            print(f"⚠️  Note: Capping beam size at 8 (requested {args.beam_size}) to match whisper-cli limits.")
+            effective_beam = 8
         else:
-            effective_beam = str(requested_beam)
+            effective_beam = args.beam_size
+
+        # Resolve prompt and decode parameters
+        preset_name, prompt_text = resolve_prompt(args.prompt, should_translate)
+        decode_args = build_decode_args(preset_name)
 
         # Primary run
         cmd = [
@@ -484,17 +590,17 @@ def main():
             "-f", audio_src,
             "-l", detected_lang,
             "-osrt",
-            "-of", str(output_prefix), 
-            "-t", args.threads,
-            "-bs", effective_beam,
-            "--best-of", effective_beam
+            "-of", str(output_prefix),
+            "-t", str(args.threads),
+            "-bs", str(effective_beam),
+            "--best-of", str(args.best_of)
         ]
-        
+
         if should_translate:
             cmd.append("-tr")
 
-        cmd += BASE_DECODE_ARGS
-        cmd += ["--prompt", "Transcribe accurately." if not should_translate else "Translate accurately."]
+        cmd += decode_args
+        cmd += ["--prompt", prompt_text]
         
         try:
             subprocess.run(cmd, check=True, env=env)
@@ -507,7 +613,7 @@ def main():
                 "-l", detected_lang,
                 "-osrt",
                 "-of", str(output_prefix),
-                "-t", args.threads,
+                "-t", str(args.threads),
                 "-bs", "5",
                 "-pp"
             ]
@@ -519,10 +625,12 @@ def main():
         # ---------- POST-PROCESS SRT ----------
         if not args.no_post and output_srt.exists():
             post_process_srt(
-                output_srt, 
-                DEFAULT_MIN_DUR_MS, 
-                DEFAULT_DEDUP_WINDOW_MS, 
-                DEFAULT_ALLOW_OVERLAP_MS
+                output_srt,
+                DEFAULT_MIN_DUR_MS,
+                DEFAULT_MAX_DUR_MS,
+                DEFAULT_DEDUP_WINDOW_MS,
+                DEFAULT_ALLOW_OVERLAP_MS,
+                DEFAULT_MAX_CHARS
             )
 
         print()
